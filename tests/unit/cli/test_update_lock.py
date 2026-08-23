@@ -129,6 +129,31 @@ def test_release_then_reacquire(tmp_path: Path) -> None:
     assert helpers.try_acquire_update_lock(tmp_path, "two") is None
 
 
+def test_release_owned_update_lock_releases_only_this_process(tmp_path: Path) -> None:
+    assert helpers.try_acquire_update_lock(tmp_path, "mine") is None
+    assert helpers.release_owned_update_lock(tmp_path) is True
+    assert helpers.read_update_lock(tmp_path) is None
+
+    owner = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        _write_lock(
+            tmp_path,
+            {
+                "pid": owner.pid,
+                "pid_create_token": process_create_token(owner.pid),
+                "target_commit": "theirs",
+                "started_at": time.time(),
+            },
+        )
+        assert helpers.release_owned_update_lock(tmp_path) is False
+        payload = helpers.read_update_lock(tmp_path)
+        assert payload is not None
+        assert payload["target_commit"] == "theirs"
+    finally:
+        owner.terminate()
+        owner.wait(timeout=30)
+
+
 def test_fresh_lock_with_dead_pid_is_stale(tmp_path: Path) -> None:
     """The headline fix: a crashed update's lock no longer blocks for 30 min."""
     _write_lock(

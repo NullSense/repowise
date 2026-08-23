@@ -27,6 +27,8 @@ from repowise.cli.helpers import (
     get_head_commit,
     load_config,
     load_state,
+    read_update_pending,
+    release_owned_update_lock,
     release_update_lock,
     resolve_command_target,
     resolve_provider_or_prompt,
@@ -368,29 +370,68 @@ def update_command(
     workspace exists upstream of the working directory. Use --no-workspace to
     force single-repo mode and --workspace to force workspace mode.
     """
-    # Click ignores the return value, so don't forward run_update's outcome
-    # here (keeps this command's ``-> None`` annotation honest).
-    run_update(
+    target = resolve_command_target(
         path=path,
-        provider_name=provider_name,
-        model=model,
-        since=since,
-        reasoning=reasoning,
-        cascade_budget=cascade_budget,
-        dry_run=dry_run,
-        workspace=workspace,
-        no_workspace=no_workspace,
+        workspace_flag=workspace,
+        no_workspace_flag=no_workspace,
         repo_alias=repo_alias,
-        index_only=index_only,
-        docs_flag=docs_flag,
-        full=full,
-        yes=yes,
-        agents_md=agents_md,
-        concurrency=concurrency,
-        no_cost_tracking=no_cost_tracking,
-        verbose=verbose,
-        progress=progress,
     )
+    repo_path = None if target.is_workspace else target.repo_path
+    next_since = since
+    next_full = full
+
+    while True:
+        try:
+            outcome = run_update(
+                path=path,
+                provider_name=provider_name,
+                model=model,
+                since=next_since,
+                reasoning=reasoning,
+                cascade_budget=cascade_budget,
+                dry_run=dry_run,
+                workspace=workspace,
+                no_workspace=no_workspace,
+                repo_alias=repo_alias,
+                index_only=index_only,
+                docs_flag=docs_flag,
+                full=next_full,
+                yes=yes,
+                agents_md=agents_md,
+                concurrency=concurrency,
+                no_cost_tracking=no_cost_tracking,
+                verbose=verbose,
+                progress=progress,
+            )
+        except Exception:
+            if repo_path is not None:
+                release_owned_update_lock(repo_path)
+            raise
+
+        # A deferred process never owned the lock. The actual owner reaches
+        # this point after its pass and performs the handoff below.
+        if repo_path is None or dry_run or outcome == UpdateOutcome.DEFERRED:
+            return
+
+        # End this pass before looking for work a contender queued. Once the
+        # lock is absent, a commit racing after our read starts its own update;
+        # a commit that raced before release left the marker we inspect here.
+        # Either side of the boundary therefore has an owner.
+        owned_pass = release_owned_update_lock(repo_path)
+        if not owned_pass:
+            # The up-to-date and full-upgrade paths manage their own narrow
+            # lock scopes. If they lost that lock, another process is already
+            # responsible for the pending commit; this invocation must not
+            # loop on its marker as though it were the owner.
+            return
+        if read_update_pending(repo_path) is None:
+            return
+
+        # An explicit range or full upgrade applies only to the first pass.
+        # Follow-up passes advance from the state that pass persisted and use
+        # ordinary incremental semantics.
+        next_since = None
+        next_full = False
 
 
 class UpdateOutcome(StrEnum):

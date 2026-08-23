@@ -37,6 +37,9 @@ from repowise.core.update_lock import (
     read_update_lock as read_update_lock,
 )
 from repowise.core.update_lock import (
+    release_owned_update_lock as release_owned_update_lock,
+)
+from repowise.core.update_lock import (
     release_update_lock as release_update_lock,
 )
 from repowise.core.update_lock import (
@@ -441,9 +444,10 @@ def clear_update_queued(repo_path: Path) -> None:
 def write_update_pending(repo_path: Path, head: str | None) -> None:
     """Record that another commit landed while an update was in flight.
 
-    The running update reads this at the end of its pass and rolls forward
-    to the new HEAD in one extra round, avoiding the failure mode where a
-    rapid burst of commits leaves the wiki indexed to an outdated commit.
+    The owning CLI update reads this after ending its current pass, releases
+    that pass's lock, and runs again at the new HEAD. This avoids the failure
+    mode where a rapid burst of commits leaves the wiki indexed to an
+    outdated commit.
     """
     if head is None:
         return

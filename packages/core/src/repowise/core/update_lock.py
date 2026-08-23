@@ -123,6 +123,31 @@ def release_update_lock(repo_path: Path) -> None:
         update_lock_path(repo_path).unlink(missing_ok=True)
 
 
+def release_owned_update_lock(repo_path: Path) -> bool:
+    """Release the update lock only when this process owns it.
+
+    ``run_update`` is also called by long-lived and workspace orchestrators,
+    so its one-shot CLI compatibility cleanup remains registered with
+    ``atexit``. The CLI coalescing loop needs to end one pass sooner, without
+    ever deleting a lock held by the contender that made this run defer.
+    Returns whether an owned lock was released.
+    """
+    from repowise.core.procutils import process_create_token
+
+    payload = read_update_lock(repo_path)
+    if payload is None or payload.get("pid") != os.getpid():
+        return False
+
+    stored_token = payload.get("pid_create_token")
+    if isinstance(stored_token, str) and stored_token:
+        current_token = process_create_token(os.getpid())
+        if current_token is not None and current_token != stored_token:
+            return False
+
+    release_update_lock(repo_path)
+    return True
+
+
 def lock_age_seconds(payload: dict[str, Any] | None) -> float | None:
     """Wall-clock age of a lock payload, or ``None`` when it cannot be told.
 
