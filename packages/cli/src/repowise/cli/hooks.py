@@ -10,10 +10,13 @@ in the same file (a lint hook, another tool's index hook).
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
+from typing import TextIO
 
 _HOOK_MARKER = "# repowise-hook-start"
 _HOOK_MARKER_END = "# repowise-hook-end"
@@ -34,10 +37,11 @@ _LEGACY_HOOK_FINGERPRINTS = (
     "/tmp/repowise-update.log",
 )
 
-# Post-commit hook contract. Works cross-platform because git always runs
-# hooks under a POSIX shell (``/bin/sh`` on Linux/macOS, git-bash on
-# Windows), so the same script body is correct everywhere — no platform
-# detection needed.
+# Post-commit hook contract. Git invokes this small synchronous launcher under
+# a POSIX shell (``/bin/sh`` on Linux/macOS, git-bash on Windows). The Python
+# dispatcher owns the platform-specific detachment flags; a shell ``(...) &``
+# child remains in the hook's process group and can be killed when an agent,
+# IDE, or CI job tears that group down after ``git commit`` exits.
 #
 # Two responsibilities:
 #
@@ -54,9 +58,9 @@ _LEGACY_HOOK_FINGERPRINTS = (
 #      The log is appended; ``update_cmd`` truncates it on its next run
 #      via ``rotate_update_log_if_needed`` so it can't grow without bound.
 #
-# The outer ``{ ... } &`` brace group ensures the queued marker is written
-# synchronously (so the augment hook sees it on the *next* tool call after
-# the commit) before the heavy update spawns into the background.
+# The brace group writes the queued marker synchronously (so the augment hook
+# sees it on the *next* tool call after the commit), then synchronously asks a
+# short-lived Python command to spawn the fully detached heavy update.
 _HOOK_SCRIPT = """\
 # repowise-hook-start
 # Auto-syncs repowise wiki after each commit (background, non-blocking).
@@ -75,17 +79,92 @@ _HOOK_SCRIPT = """\
     printf '\\n--- post-commit hook fired at %s for HEAD %s ---\\n' \\
       "$(date 2>/dev/null)" "$HEAD"
   } >> "$LOG" 2>/dev/null || true
-  (
-    cd "$ROOT" || exit 1
-    if command -v repowise >/dev/null 2>&1; then
-      repowise update >> "$LOG" 2>&1
-    elif command -v uv >/dev/null 2>&1; then
-      uv run repowise update >> "$LOG" 2>&1
-    fi
-  ) &
+  if command -v repowise >/dev/null 2>&1; then
+    repowise hook dispatch-update "$ROOT" "$HEAD" >> "$LOG" 2>&1 || true
+  elif command -v uv >/dev/null 2>&1; then
+    uv run repowise hook dispatch-update "$ROOT" "$HEAD" >> "$LOG" 2>&1 || true
+  else
+    printf '[repowise hook] dispatch unavailable target=%s: repowise and uv not found\\n' \\
+      "$HEAD" >> "$LOG" 2>/dev/null || true
+    rm -f "$ROOT/.repowise/.update.queued" 2>/dev/null || true
+  fi
 } >/dev/null 2>&1
 # repowise-hook-end
 """
+
+
+def _spawn_detached(command: list[str], *, cwd: Path, output: TextIO) -> subprocess.Popen[bytes]:
+    """Spawn *command* outside the launcher's process/session lifetime."""
+    kwargs: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": output,
+        "stderr": subprocess.STDOUT,
+        "close_fds": True,
+        "cwd": str(cwd),
+    }
+    if os.name == "nt":
+        # DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW.
+        # The independent process group is required for agent/CI job teardown;
+        # CREATE_NO_WINDOW keeps post-commit invisible to desktop users.
+        kwargs["creationflags"] = 0x00000008 | 0x00000200 | 0x08000000
+    else:
+        kwargs["start_new_session"] = True
+    return subprocess.Popen(command, **kwargs)  # type: ignore[arg-type]
+
+
+def _clear_matching_queue(repo_path: Path, target_commit: str) -> None:
+    """Clear a failed dispatch marker without erasing a newer commit's marker."""
+    from repowise.cli.helpers import clear_update_queued, read_update_queued
+
+    queued = read_update_queued(repo_path)
+    if queued is not None and queued.get("target_commit") == target_commit:
+        clear_update_queued(repo_path)
+
+
+def dispatch_update(repo_path: Path, target_commit: str) -> bool:
+    """Detach one update process and record a diagnosable launch outcome.
+
+    The real update command still owns locking, coalescing, and queue cleanup.
+    This seam only guarantees that it survives the short-lived Git hook.
+    """
+    log_path = repo_path / ".repowise" / ".update.log"
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        output = log_path.open("a", encoding="utf-8", errors="replace")
+    except OSError:
+        _clear_matching_queue(repo_path, target_commit)
+        return False
+
+    try:
+        if not sys.executable or not Path(sys.executable).is_file():
+            output.write(
+                "[repowise hook] dispatch resolution failed "
+                f"target={target_commit}: Python executable unavailable\n"
+            )
+            output.flush()
+            _clear_matching_queue(repo_path, target_commit)
+            return False
+
+        command = [
+            sys.executable,
+            "-m",
+            "repowise.cli.main",
+            "update",
+            str(repo_path),
+        ]
+        try:
+            process = _spawn_detached(command, cwd=repo_path, output=output)
+        except OSError as exc:
+            output.write(f"[repowise hook] spawn failed target={target_commit}: {exc}\n")
+            output.flush()
+            _clear_matching_queue(repo_path, target_commit)
+            return False
+
+        output.write(f"[repowise hook] spawned pid={process.pid} target={target_commit}\n")
+        output.flush()
+        return True
+    finally:
+        output.close()
 
 
 def _git_root(path: Path) -> Path | None:

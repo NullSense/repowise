@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import click
 
 from repowise.cli.helpers import (
@@ -47,6 +49,20 @@ def _hook_target(
     )
     target.notice(console, command="hook")
     return target
+
+
+@hook_group.command("dispatch-update", hidden=True)
+@click.argument(
+    "path",
+    type=click.Path(path_type=Path, file_okay=False),
+)
+@click.argument("target_commit")
+def hook_dispatch_update(path: Path, target_commit: str) -> None:
+    """Detach the updater from a short-lived Git-hook process."""
+    from repowise.cli.hooks import dispatch_update
+
+    if not dispatch_update(path.resolve(), target_commit):
+        raise click.exceptions.Exit(1)
 
 
 @hook_group.command("install")

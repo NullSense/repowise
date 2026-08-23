@@ -10,7 +10,12 @@ new marker block.
 
 from __future__ import annotations
 
+import json
+import os
 import subprocess
+import sys
+import time
+from pathlib import Path
 
 import pytest
 
@@ -239,3 +244,169 @@ class TestInstalledHookScript:
         assert ".update.log" in _HOOK_SCRIPT
         # And no silent /dev/null sink — that was the original bug.
         assert "> /dev/null 2>&1" not in _HOOK_SCRIPT or ">> \"$LOG\"" in _HOOK_SCRIPT
+
+    def test_hook_invokes_python_dispatcher_synchronously(self):
+        from repowise.cli.hooks import _HOOK_SCRIPT
+
+        assert "hook dispatch-update" in _HOOK_SCRIPT
+        assert "repowise update >>" not in _HOOK_SCRIPT
+        assert ") &" not in _HOOK_SCRIPT
+        assert "dispatch unavailable" in _HOOK_SCRIPT
+        failure_line = next(
+            line for line in _HOOK_SCRIPT.splitlines() if "dispatch unavailable" in line
+        )
+        assert r"not found\n" in failure_line
+        assert failure_line.endswith("\\")
+
+
+class TestDetachedUpdateDispatch:
+    @pytest.fixture
+    def indexed_repo(self, git_repo: Path) -> Path:
+        repowise_dir = git_repo / ".repowise"
+        repowise_dir.mkdir()
+        return git_repo
+
+    def test_dispatch_detaches_update_and_logs_pid_and_target(
+        self, indexed_repo: Path, monkeypatch
+    ):
+        from repowise.cli import hooks
+
+        target = "deadbeef"
+        queued = indexed_repo / ".repowise" / ".update.queued"
+        queued.write_text(
+            json.dumps({"target_commit": target, "queued_at": time.time()}),
+            encoding="utf-8",
+        )
+        spawned: dict[str, object] = {}
+
+        class FakeProcess:
+            pid = 4242
+
+        def fake_popen(command, **kwargs):
+            spawned["command"] = command
+            spawned["kwargs"] = kwargs
+            return FakeProcess()
+
+        monkeypatch.setattr(hooks.subprocess, "Popen", fake_popen)
+
+        assert hooks.dispatch_update(indexed_repo, target) is True
+        assert spawned["command"] == [
+            sys.executable,
+            "-m",
+            "repowise.cli.main",
+            "update",
+            str(indexed_repo),
+        ]
+        kwargs = spawned["kwargs"]
+        assert kwargs["stdin"] is subprocess.DEVNULL
+        assert kwargs["stderr"] is subprocess.STDOUT
+        assert kwargs["close_fds"] is True
+        if os.name == "nt":
+            assert kwargs["creationflags"] == (0x00000008 | 0x00000200 | 0x08000000)
+        else:
+            assert kwargs["start_new_session"] is True
+        assert kwargs["cwd"] == str(indexed_repo)
+        assert kwargs["stdout"].name == str(indexed_repo / ".repowise" / ".update.log")
+        assert queued.exists(), "the update process owns successful queue cleanup"
+
+        log = (indexed_repo / ".repowise" / ".update.log").read_text(encoding="utf-8")
+        assert f"spawned pid=4242 target={target}" in log
+
+    def test_hidden_cli_dispatches_synchronously(self, indexed_repo: Path, monkeypatch):
+        from click.testing import CliRunner
+
+        from repowise.cli import hooks
+        from repowise.cli.commands.hook_cmd import hook_group
+
+        calls: list[tuple[Path, str]] = []
+
+        def fake_dispatch(path: Path, target: str) -> bool:
+            calls.append((path, target))
+            return True
+
+        monkeypatch.setattr(hooks, "dispatch_update", fake_dispatch)
+
+        result = CliRunner().invoke(
+            hook_group,
+            ["dispatch-update", str(indexed_repo), "deadbeef"],
+        )
+
+        assert result.exit_code == 0, result.output
+        assert calls == [(indexed_repo.resolve(), "deadbeef")]
+        assert "dispatch-update" not in CliRunner().invoke(hook_group, ["--help"]).output
+
+    def test_spawn_failure_is_logged_and_clears_matching_queue(
+        self, indexed_repo: Path, monkeypatch
+    ):
+        from repowise.cli import hooks
+
+        target = "deadbeef"
+        queued = indexed_repo / ".repowise" / ".update.queued"
+        queued.write_text(
+            json.dumps({"target_commit": target, "queued_at": time.time()}),
+            encoding="utf-8",
+        )
+
+        def fail_popen(*_args, **_kwargs):
+            raise OSError("process table full")
+
+        monkeypatch.setattr(hooks.subprocess, "Popen", fail_popen)
+
+        assert hooks.dispatch_update(indexed_repo, target) is False
+        assert not queued.exists()
+        log = (indexed_repo / ".repowise" / ".update.log").read_text(encoding="utf-8")
+        assert f"spawn failed target={target}" in log
+        assert "process table full" in log
+
+    def test_resolution_failure_is_logged_and_clears_matching_queue(
+        self, indexed_repo: Path, monkeypatch
+    ):
+        from repowise.cli import hooks
+
+        target = "deadbeef"
+        queued = indexed_repo / ".repowise" / ".update.queued"
+        queued.write_text(
+            json.dumps({"target_commit": target, "queued_at": time.time()}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(hooks.sys, "executable", "")
+
+        assert hooks.dispatch_update(indexed_repo, target) is False
+        assert not queued.exists()
+        log = (indexed_repo / ".repowise" / ".update.log").read_text(encoding="utf-8")
+        assert f"dispatch resolution failed target={target}" in log
+        assert "Python executable unavailable" in log
+
+    def test_failed_older_dispatch_preserves_newer_queue(self, indexed_repo: Path, monkeypatch):
+        from repowise.cli import hooks
+
+        queued = indexed_repo / ".repowise" / ".update.queued"
+        queued.write_text(
+            json.dumps({"target_commit": "newer", "queued_at": time.time()}),
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(hooks.sys, "executable", "")
+
+        assert hooks.dispatch_update(indexed_repo, "older") is False
+        assert json.loads(queued.read_text(encoding="utf-8"))["target_commit"] == "newer"
+
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX session assertion")
+    def test_detached_child_has_own_session_and_completes(self, tmp_path: Path):
+        from repowise.cli.hooks import _spawn_detached
+
+        completed = tmp_path / "completed"
+        log_path = tmp_path / "child.log"
+        command = [
+            sys.executable,
+            "-c",
+            (
+                "import pathlib,time; time.sleep(0.05); "
+                f"pathlib.Path({str(completed)!r}).write_text('done')"
+            ),
+        ]
+        with log_path.open("a", encoding="utf-8") as output:
+            process = _spawn_detached(command, cwd=tmp_path, output=output)
+
+        assert os.getsid(process.pid) == process.pid
+        assert process.wait(timeout=3) == 0
+        assert completed.read_text(encoding="utf-8") == "done"
