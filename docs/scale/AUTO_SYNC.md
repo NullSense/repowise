@@ -37,10 +37,15 @@ hooks (linters, formatters, etc.) in the same `post-commit` file.
 ### What happens
 
 1. You run `git commit`
-2. The hook fires in the background (non-blocking)
-3. `repowise update` diffs the new commit against the last synced commit
-4. Only affected pages are regenerated (typically 3-10 for a small commit)
-5. Graph, git stats, dead code, and decisions are also refreshed
+2. The hook records the target commit, then synchronously invokes a small dispatcher
+3. The dispatcher starts a detached updater with its output captured in `.repowise/.update.log`;
+   the hook returns without waiting for the update
+4. `repowise update` diffs the new commit against the last synced commit
+5. Only affected pages are regenerated (typically 3-10 for a small commit)
+6. Graph, git stats, dead code, and decisions are also refreshed
+
+Rapid commits coalesce: a running updater drains the latest queued target before it exits, so hooks
+do not start parallel full updates from the same stale base.
 
 ### Check hook status
 
