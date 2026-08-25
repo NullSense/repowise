@@ -30,6 +30,7 @@ still MCP-only.
 from __future__ import annotations
 
 import contextlib
+import os
 from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,7 @@ async def _acall_tool(
     from repowise.server.chat_tools import init_tool_state
     from repowise.server.mcp_server._failure_shield import _shape_exception
 
+    inserted_env = _overlay_repo_environment(repo_path)
     engine = None
     store = None
     # The MCP surface composes every tool as
@@ -95,6 +97,31 @@ async def _acall_tool(
         if engine is not None:
             with contextlib.suppress(Exception):
                 await engine.dispose()
+        for key in inserted_env:
+            os.environ.pop(key, None)
+
+
+def _overlay_repo_environment(repo_path: Path) -> tuple[str, ...]:
+    """Publish one repo's missing settings for the duration of a CLI tool call.
+
+    Provider credentials can be resolved directly from ``.repowise/.env``, but
+    model shape and retrieval policy are intentionally ordinary environment
+    settings: embedding model and dimensions, asymmetric query/document
+    prefixes, and timeout budgets all read ``os.environ`` at their call sites.
+
+    Existing process values win, matching :func:`load_dotenv`. Only inserted
+    keys are returned so the caller can remove exactly what it published after
+    the tool completes. That restoration matters for workspace fan-out, which
+    runs several single-repo bridge calls in one process.
+    """
+    from repowise.core.repo_config import load_repo_env
+
+    inserted: list[str] = []
+    for key, value in load_repo_env(repo_path).items():
+        if key not in os.environ:
+            os.environ[key] = value
+            inserted.append(key)
+    return tuple(inserted)
 
 
 async def _open_vector_store(repo_path: Path) -> Any:

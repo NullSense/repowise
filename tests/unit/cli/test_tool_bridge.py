@@ -10,6 +10,8 @@ invisible in a one-shot process and fatal in a test suite).
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from repowise.cli import tool_bridge
@@ -165,6 +167,48 @@ def test_the_factory_runs_inside_the_loop_after_the_state_is_published(wired):
 
     tool_bridge.call_tool(repo, _tool, "get_symbol")
     assert seen and seen[0]["repo_path"] == str(repo)
+
+
+def test_repo_dotenv_is_scoped_over_store_open_and_tool_call(wired, monkeypatch):
+    """Provider shape settings must reach every half of a CLI tool call.
+
+    ``build_embedder`` can read the API key from the repo directly, but model,
+    dimension, asymmetric-prefix, and timeout resolution read ``os.environ``.
+    Without a scoped overlay, ``repowise search`` builds the default 1536-wide
+    OpenAI query embedder against a 2048-wide local index, silently loses the
+    vector leg, and returns FTS-only results while claiming no degradation.
+
+    The overlay must be removed afterwards: workspace fan-out invokes this
+    bridge once per repo in the same process, so first-repo-wins would be a
+    cross-repo configuration leak.
+    """
+    _engine, store, _published, repo = wired
+    repowise_dir = repo / ".repowise"
+    repowise_dir.mkdir()
+    (repowise_dir / ".env").write_text(
+        'REPOWISE_EMBEDDING_DECLARED_DIMS=2048\n'
+        'REPOWISE_EMBED_QUERY_PREFIX="query: "\n',
+        encoding="utf-8",
+    )
+    keys = ("REPOWISE_EMBEDDING_DECLARED_DIMS", "REPOWISE_EMBED_QUERY_PREFIX")
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+
+    seen: list[tuple[str | None, str | None]] = []
+
+    async def _capture_open(_repo_path):
+        seen.append(tuple(os.environ.get(key) for key in keys))
+        return store
+
+    monkeypatch.setattr(tool_bridge, "_open_vector_store", _capture_open)
+
+    async def _tool():
+        seen.append(tuple(os.environ.get(key) for key in keys))
+        return {"ok": True}
+
+    assert tool_bridge.call_tool(repo, _tool, "search_codebase") == {"ok": True}
+    assert seen == [("2048", "query: "), ("2048", "query: ")]
+    assert all(key not in os.environ for key in keys)
 
 
 @pytest.fixture
