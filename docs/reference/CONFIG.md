@@ -749,6 +749,20 @@ The `.repowise/.env` file is gitignored automatically.
 | `OLLAMA_EMBEDDING_DIMS` | Ollama embedding output dimensions (optional; inferred from the model otherwise) |
 | `OLLAMA_EMBEDDING_TIMEOUT` | As above, `ollama` only; raise it for long pages on slow local models |
 
+### Reranking
+
+Cross-encoder reranking is optional. It applies only to semantic candidates in
+`search_codebase` and `get_answer`; exact symbol and path results are unchanged.
+Failures preserve the fused ranking and are reported in response metadata.
+
+| Variable | Description |
+|----------|-------------|
+| `REPOWISE_RERANK_MODEL` | Model name sent to the OpenAI-compatible `/rerank` endpoint; unset disables reranking |
+| `REPOWISE_RERANK_BASE_URL` | Endpoint root, for example `http://127.0.0.1:4000` |
+| `REPOWISE_RERANK_API_KEY` | Optional bearer token; falls back to `OPENAI_API_KEY` |
+| `REPOWISE_RERANK_TIMEOUT_S` | Request timeout in seconds (default: `30`, capped at `120`) |
+| `REPOWISE_RERANK_CANDIDATES` | Leading semantic candidates to rerank (default: `15`, capped at `50`) |
+
 ### Server and database
 
 | Variable | Description |

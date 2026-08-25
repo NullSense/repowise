@@ -35,6 +35,11 @@ from repowise.server.mcp_server._helpers import (
 )
 from repowise.server.mcp_server._meta import EXHAUSTIVE_SWEEP_HINT
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._model_rerank import (
+    begin_rerank_record,
+    rerank_candidates,
+    rerank_record,
+)
 from repowise.server.mcp_server._page_paths import file_candidates, hit_file_path
 from repowise.server.mcp_server._prose_symbols import symbol_backed_pages
 from repowise.server.mcp_server.tool_search_symbols import (
@@ -44,6 +49,17 @@ from repowise.server.mcp_server.tool_search_symbols import (
 )
 
 _log = logging.getLogger("repowise.mcp.search")
+
+
+def _reranker_meta_extra() -> dict[str, Any] | None:
+    record = rerank_record()
+    return {"reranker": record} if record is not None else None
+
+
+async def _rerank_semantic(query: str, output: list[dict]) -> list[dict]:
+    result = await rerank_candidates(query, output, score_key="relevance_score")
+    return result.hits
+
 
 # Minimum relevance score below which results are dropped. Prevents
 # returning semantically unrelated pages when the corpus has no real match.
@@ -738,6 +754,8 @@ async def _search_single_repo(
         _attach_paths(output, page_info)
         output = filter_dicts_by_key(output, "target_path", _get_exclude_spec(ctx.path))
 
+    output = await _rerank_semantic(query, output)
+
     _downweight_test_pages(output, query)
     _sort_demoting_noise(output, query)
     output = _dedup_decisions(output)
@@ -767,7 +785,10 @@ async def _federated_search(
     # Derive confidence from RRF position
     _assign_confidence(output, "rrf_score", "confidence_score")
 
-    response: dict = {"results": output, "_meta": _build_meta()}
+    response: dict = {
+        "results": output,
+        "_meta": _build_meta(extra=_reranker_meta_extra()),
+    }
     # Drawn from every repo's ranked list, not the merged cut: a workspace
     # search that spends its window on module pages should still be able to
     # name files.
@@ -959,7 +980,11 @@ async def _structured_search(
     response: dict = {
         "results": results,
         "mode": mode,
-        "_meta": _build_meta(repository=repository, targets=_result_paths(results)),
+        "_meta": _build_meta(
+            repository=repository,
+            targets=_result_paths(results),
+            extra=_reranker_meta_extra(),
+        ),
     }
     # Symbols first, then everything else the window holds: in symbol and
     # hybrid modes the ranked pool leads with symbol hits, and those are the
@@ -1046,6 +1071,7 @@ async def search_codebase(
         mode: auto | concept | symbol | path | hybrid.
         symbol_kind: filter symbol hits by kind (function|class|method|...).
     """
+    begin_rerank_record()
     grep_hint = _grep_hint_for(query)
     resolved_mode = _resolve_mode(query, mode)
 
@@ -1102,6 +1128,8 @@ async def search_codebase(
 
         output = filter_dicts_by_key(output, "target_path", _get_exclude_spec(ctx.path))
 
+        output = await _rerank_semantic(query, output)
+
         for item in output:
             # Freshness boost: recently-active files rank higher
             target_path = page_info.get(item["page_id"])
@@ -1131,7 +1159,11 @@ async def search_codebase(
 
     response: dict = {
         "results": output,
-        "_meta": _build_meta(repository=repository, targets=_result_paths(output)),
+        "_meta": _build_meta(
+            repository=repository,
+            targets=_result_paths(output),
+            extra=_reranker_meta_extra(),
+        ),
     }
     if candidates := file_candidates(ranked, limit=limit):
         response["candidates"] = candidates

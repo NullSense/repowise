@@ -72,6 +72,7 @@ from repowise.server.mcp_server._answer_context import (
 from repowise.server.mcp_server._answer_context import (
     is_why_question as _is_why_question,
 )
+from repowise.server.mcp_server._answer_pipeline import _record_leg
 from repowise.server.mcp_server._answer_pipeline import (
     apply_pagerank_bias as _apply_pagerank_bias,
 )
@@ -105,6 +106,7 @@ from repowise.server.mcp_server._helpers import (
 from repowise.server.mcp_server._meta import NO_HITS_RECOVERY_HINT as _NO_HITS_RECOVERY_HINT
 from repowise.server.mcp_server._meta import answer_hint as _answer_hint
 from repowise.server.mcp_server._meta import build_meta as _build_meta
+from repowise.server.mcp_server._model_rerank import begin_rerank_record, rerank_candidates
 from repowise.server.mcp_server._neighbor_rerank import (
     expand_via_neighbor_rerank as _expand_via_neighbor_rerank,
 )
@@ -228,9 +230,10 @@ async def _run_retrieval_pipeline(
     call.
 
     Stages live in ``_answer_pipeline`` so each can evolve without rereading the
-    orchestrator: hybrid retrieval (FTS + vector + RRF) → hydration → coverage
-    rerank → domain penalty → intersection boost → PageRank bias → 1-hop graph
-    expansion. This function only sequences them and decides when to stop.
+    orchestrator: hybrid retrieval (FTS + vector + RRF) → hydration → optional
+    cross-encoder rerank → coverage rerank → domain penalty → intersection
+    boost → PageRank bias → 1-hop graph expansion. This function only sequences
+    them and decides when to stop.
     """
     hits = await _hybrid_retrieve(question, ctx)
     hits = await _hydrate_hits(hits, ctx, scope=scope)
@@ -238,6 +241,16 @@ async def _run_retrieval_pipeline(
     # Drop excluded files right after hydration (which attaches target_path) so
     # they never enter ranking, citations, or fallback_targets.
     hits = filter_dicts_by_key(hits, "target_path", exclude_spec)
+
+    # Cross-encoder ranking is optional and rank-only: the model chooses the
+    # order while the fused score geometry is retained for every calibrated
+    # policy below. A timeout/error is fail-open and recorded as a degraded
+    # retrieval leg on the answer the caller receives.
+    begin_rerank_record()
+    reranked = await rerank_candidates(question, hits, score_key="score")
+    hits = reranked.hits
+    if reranked.meta is not None:
+        _record_leg("rerank", reranked.meta["status"])
 
     # Identifiers the question names explicitly — drives symbol anchoring
     # (below) and question-aware symbol promotion (during hydration).

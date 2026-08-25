@@ -18,6 +18,7 @@ from pathlib import Path
 
 from repowise.core.reasoning import ReasoningMode, resolve_reasoning
 from repowise.core.repo_config import load_repo_config
+from repowise.server.mcp_server._model_rerank import reranker_cache_identity
 from repowise.server.mcp_server.tool_answer.config import (
     _SYNTHESIS_MAX_TOKENS,
     _SYNTHESIS_MAX_TOKENS_ENV,
@@ -65,7 +66,7 @@ def _hash_answer_identity(question: str, normalized_scope: str | None) -> str:
     # JSON preserves the distinction between null and every possible scope
     # string (including a literal "<unscoped>") without a sentinel collision.
     identity = _json.dumps(
-        ["v2", normalized_question, normalized_scope],
+        ["v3", normalized_question, normalized_scope, reranker_cache_identity()],
         ensure_ascii=False,
         separators=(",", ":"),
     )
