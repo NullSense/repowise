@@ -59,6 +59,31 @@ def test_query_prefix_does_not_leak_into_document(monkeypatch):
     assert resolve_embed_prefix("document") == ""
 
 
+def test_a_set_prefix_says_once_that_a_reindex_is_needed(monkeypatch, capsys):
+    from repowise.core.providers.embedding import base
+
+    _clear(monkeypatch)
+    monkeypatch.setattr(base, "_PREFIX_WARNED", set())
+    monkeypatch.setenv("REPOWISE_EMBED_QUERY_PREFIX", "query: ")
+    resolve_embed_prefix("query")
+    resolve_embed_prefix("query")
+    resolve_embed_prefix("document")  # unset: nothing to say
+
+    err = capsys.readouterr().err
+    assert err.count("repowise reindex") == 1
+    assert "REPOWISE_EMBED_QUERY_PREFIX" in err
+
+
+def test_unset_prefixes_print_nothing(monkeypatch, capsys):
+    from repowise.core.providers.embedding import base
+
+    _clear(monkeypatch)
+    monkeypatch.setattr(base, "_PREFIX_WARNED", set())
+    resolve_embed_prefix("query")
+    resolve_embed_prefix("document")
+    assert capsys.readouterr().err == ""
+
+
 def test_invalid_kind_raises():
     with pytest.raises(ValueError, match="kind must be 'query' or 'document'"):
         resolve_embed_prefix("passage")

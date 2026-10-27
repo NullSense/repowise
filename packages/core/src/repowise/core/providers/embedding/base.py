@@ -95,7 +95,34 @@ def resolve_embed_prefix(kind: str) -> str:
         var = _EMBED_PREFIX_ENV[kind]
     except KeyError:
         raise ValueError(f"kind must be 'query' or 'document', got {kind!r}") from None
-    return os.environ.get(var, "")
+    prefix = os.environ.get(var, "")
+    if prefix and var not in _PREFIX_WARNED:
+        _PREFIX_WARNED.add(var)
+        _report_prefix_needs_reindex(var)
+    return prefix
+
+
+# Vars already reported this process, so the notice prints once, not per batch.
+_PREFIX_WARNED: set[str] = set()
+
+
+def _report_prefix_needs_reindex(var: str) -> None:
+    """Tell the operator a prefix only matches vectors embedded under it.
+
+    Vectors already in the store were embedded with whatever prefix was set
+    then; a query under a new prefix loses its shared framing with them and
+    recall drops with no error. Shortcut: the store does not record the prefix
+    its vectors were built with, so this cannot tell whether a reindex already
+    happened and says it once per process whenever a prefix is set. Upgrade
+    path: stamp the prefixes into the vector store at write time and warn only
+    on a mismatch. stderr for the same reason as ``_report_invalid_timeout``.
+    """
+    log.warning("embed_prefix_set", var=var)
+    print(
+        f"{var} is set. Vectors embedded before it was set or changed do not "
+        "match it; run `repowise reindex` once after changing it.",
+        file=sys.stderr,
+    )
 
 
 def _report_invalid_timeout(var: str, raw: str, default: float) -> None:

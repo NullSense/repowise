@@ -1013,6 +1013,8 @@ yields a client error instead of Repowise's "synthesis exceeded its budget".
 | `REPOWISE_VECTOR_SEARCH_TIMEOUT_S` | Seconds per vector-store query (default `30`, capped at `120`) |
 | `OLLAMA_EMBEDDING_MODEL` | Ollama embedding model; also selects the `ollama` embedder |
 | `OLLAMA_EMBEDDING_DIMS` | Ollama output dimensions (optional; inferred from the model) |
+| `REPOWISE_EMBED_QUERY_PREFIX` | Text the `openai` embedder prepends to search queries (default empty) |
+| `REPOWISE_EMBED_DOC_PREFIX` | Text the `openai` embedder prepends to stored pages and decisions (default empty) |
 
 - Raise the embed timeout for a local endpoint: one request embeds a whole
   batch, and an expired batch shows only as `N/N items failed to embed`.
@@ -1023,6 +1025,9 @@ yields a client error instead of Repowise's "synthesis exceeded its budget".
   on a slow disk or large wiki; a timeout drops the semantic leg with a
   warning, leaving full-text hits.
 - An unparseable timeout warns and keeps the default.
+- Set the embed prefixes only for a model trained with them (such as
+  `query: ` / `passage: `), then run `repowise reindex`: vectors stored before
+  a prefix was set or changed stop matching, with no error.
 
 ### Server and database
 
