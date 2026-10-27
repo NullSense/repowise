@@ -17,6 +17,14 @@ def _capped(values: list, cap: int = _LIST_CAP) -> list:
     return list(values or [])[:cap]
 
 
+def _with_trust(projected: dict, source: dict) -> dict:
+    """Keep the compact evidence contract visible in default agent output."""
+    for key in ("source", "provenance", "evidence_refs", "restates"):
+        if key in source:
+            projected[key] = source[key]
+    return projected
+
+
 def _project_decision(decision: dict) -> dict:
     """One decision record, trimmed to the decision and why it was taken."""
     out = {
@@ -34,17 +42,17 @@ def _project_decision(decision: dict) -> dict:
             out["affected_files_total"] = total
     if decision.get("still_true"):
         out["still_true"] = decision["still_true"]
-    return out
+    return _with_trust(out, decision)
 
 
 def _project_episode(episode: dict) -> dict:
-    return {
+    return _with_trust({
         "kind": episode.get("kind", ""),
         "subject": episode.get("subject", ""),
         "recorded": episode.get("recorded", ""),
         "evidence": episode.get("evidence", ""),
         "still_true": episode.get("still_true", ""),
-    }
+    }, episode)
 
 
 _ARCH_LAYERS = (
@@ -71,7 +79,10 @@ def _project_archaeology(arch: dict) -> dict:
         rows = arch.get(key) or []
         if not rows:
             continue
-        out[key] = [{f: c.get(f, "") for f in fields} for c in _capped(rows)]
+        out[key] = [
+            _with_trust({f: c.get(f, "") for f in fields}, c)
+            for c in _capped(rows)
+        ]
         if len(rows) > len(out[key]):
             out[f"{key}_total"] = len(rows)
     return out
@@ -85,6 +96,13 @@ def _project_target_entry(entry: dict) -> dict:
     ``git_archaeology`` the same three capped layers.
     """
     out: dict = {"governing_decisions": entry.get("governing_decisions") or []}
+    # Both authority lanes. Dropping the candidate one here would print an
+    # empty card for every repository with no acceptances, which is most of
+    # them: the tool moved unaccepted records out of ``governing_decisions``
+    # precisely so they stop reading as rules, not so they stop being shown.
+    for key in ("candidate_decisions", "candidate_decisions_omitted"):
+        if entry.get(key):
+            out[key] = entry[key]
     origin = entry.get("origin") or {}
     if origin:
         out["origin"] = {
@@ -120,8 +138,9 @@ def project(payload: dict) -> dict:
                         and target_context
     dashboard kept      summary, counts, and the head of each of
                         stale_decisions / proposed_awaiting_review /
-                        ungoverned_hotspots / conflicts, with the
-                        full count beside it
+                        ungoverned_hotspots / conflicts /
+                        retired_decisions / unscoped_decisions, with
+                        the full count beside it
     ==================  ===========================================
 
     Dropped throughout: a decision's ``context``, ``consequences``,
@@ -147,6 +166,9 @@ def project(payload: dict) -> dict:
         out["counts"] = payload["counts"]
     if payload.get("alignment"):
         out["alignment"] = payload["alignment"]
+    # Which lane the answer rests on. Only "decision" is a ruling.
+    if payload.get("answer_basis"):
+        out["answer_basis"] = payload["answer_basis"]
 
     decisions = payload.get("decisions")
     if decisions is not None:
@@ -173,12 +195,12 @@ def project(payload: dict) -> dict:
         commits = origin.get("key_commits") or []
         if commits:
             out["origin_story"]["key_commits"] = [
-                {
+                _with_trust({
                     "sha": c.get("sha", ""),
                     "date": c.get("date", ""),
                     "author": c.get("author", ""),
                     "message": c.get("message", ""),
-                }
+                }, c)
                 for c in _capped(commits)
             ]
 
@@ -205,7 +227,9 @@ def project(payload: dict) -> dict:
         out["git_archaeology"] = _project_archaeology(payload["git_archaeology"])
     if payload.get("code_rationale"):
         out["code_rationale"] = [
-            {k: entry.get(k) for k in ("path", "lines", "comment")}
+            _with_trust(
+                {k: entry.get(k) for k in ("path", "lines", "comment")}, entry
+            )
             for entry in _capped(payload["code_rationale"])
         ]
     if payload.get("target_context"):
@@ -214,7 +238,14 @@ def project(payload: dict) -> dict:
             for target, entry in payload["target_context"].items()
         }
 
-    for key in ("stale_decisions", "proposed_awaiting_review", "ungoverned_hotspots", "conflicts"):
+    for key in (
+        "stale_decisions",
+        "proposed_awaiting_review",
+        "ungoverned_hotspots",
+        "conflicts",
+        "retired_decisions",
+        "unscoped_decisions",
+    ):
         values = payload.get(key)
         if values:
             out[key] = _capped(values)
@@ -255,7 +286,7 @@ def why_command(
 
     QUERY is a question ("why is auth using JWT?"), a file path (its governing
     decisions, origin story and alignment score), or omitted for the decision
-    health dashboard — or for the --targets, when any are named. Falls back to
+    health dashboard — or for repeatable --target paths, when named. Falls back to
     git archaeology when a path has no decisions, so it is never empty.
     """
     fmt = _ta.resolve_format_for(fmt, full)
@@ -325,6 +356,7 @@ def _render(projected: dict) -> None:
                 f"pass --full for the rest.[/dim]"
             )
 
+    seen_commits: set[tuple[str, str]] = set()
     origin = projected.get("origin_story") or {}
     if origin.get("available"):
         console.print(
@@ -334,6 +366,9 @@ def _render(projected: dict) -> None:
             f"({_owner_share(origin.get('author_commit_pct'))})"
         )
         for c in origin.get("key_commits") or []:
+            sha = str(c.get("sha", "")).lower()
+            if sha:
+                seen_commits.add((sha, str(c.get("message", ""))))
             console.print(
                 f"  [dim]{c.get('sha', '')} {str(c.get('date', ''))[:10]}[/dim] "
                 f"{c.get('message', '')}"
@@ -341,7 +376,7 @@ def _render(projected: dict) -> None:
 
     if projected.get("git_archaeology"):
         console.print("")
-        _render_archaeology(console, projected["git_archaeology"], indent="")
+        _render_archaeology(console, projected["git_archaeology"], indent="", seen=seen_commits)
 
     rationale = projected.get("code_rationale") or []
     if rationale:
@@ -357,6 +392,19 @@ def _render(projected: dict) -> None:
         for governing in entry.get("governing_decisions") or []:
             console.print(
                 f"  {governing.get('title', '')} [dim]({governing.get('status', '')})[/dim]"
+            )
+        for candidate in entry.get("candidate_decisions") or []:
+            # Labelled, never printed beside the rules unmarked. Nobody has
+            # accepted these, so they are a review request and not a rule.
+            console.print(
+                f"  [dim]candidate:[/dim] {candidate.get('title', '')} "
+                f"[dim]({candidate.get('status', '')})[/dim]"
+            )
+        omitted = entry.get("candidate_decisions_omitted") or {}
+        if omitted.get("suppressed"):
+            console.print(
+                f"  [dim]{omitted['suppressed']} candidate(s) not matching the "
+                f"question. {omitted.get('recover_with', '')}[/dim]"
             )
         origin = entry.get("origin") or {}
         if origin.get("summary"):
@@ -376,6 +424,8 @@ def _render(projected: dict) -> None:
         ("Stale decisions", "stale_decisions"),
         ("Proposed, awaiting review", "proposed_awaiting_review"),
         ("Conflicts", "conflicts"),
+        ("Retired", "retired_decisions"),
+        ("Accepted, naming no file", "unscoped_decisions"),
     ):
         rows = projected.get(key) or []
         if rows:
@@ -428,6 +478,8 @@ _RENDERABLE_BLOCKS = (
     "proposed_awaiting_review",
     "conflicts",
     "ungoverned_hotspots",
+    "retired_decisions",
+    "unscoped_decisions",
     "related_documentation",
     "episodes",
 )
@@ -439,8 +491,24 @@ _RENDERABLE_BLOCKS = (
 _owner_share = _ta.owner_share
 
 
-def _render_archaeology(console, arch: dict, *, indent: str) -> None:
+def _already_rendered(seen: set[tuple[str, str]], sha: str, message: str) -> bool:
+    """Match full IDs where available; short indexed IDs need the subject too."""
+    return any(
+        old == sha
+        or (
+            old_message == message
+            and old != sha
+            and (old.startswith(sha) or sha.startswith(old))
+        )
+        for old, old_message in seen
+    )
+
+
+def _render_archaeology(
+    console, arch: dict, *, indent: str, seen: set[tuple[str, str]] | None = None
+) -> None:
     """The archaeology block, at the top level or nested under one ``--target``."""
+    seen = seen if seen is not None else set()
     console.print(f"{indent}[bold]Git archaeology[/bold] {arch.get('summary', '')}")
     for label, key in (
         ("this file", "file_commits"),
@@ -449,6 +517,12 @@ def _render_archaeology(console, arch: dict, *, indent: str) -> None:
     ):
         rows = arch.get(key) or []
         for c in rows:
+            sha = str(c.get("sha", "")).lower()
+            message = str(c.get("message", ""))
+            if key != "cross_references" and sha and _already_rendered(seen, sha, message):
+                continue
+            if key != "cross_references" and sha:
+                seen.add((sha, message))
             where = f" [dim]({c['source_file']})[/dim]" if c.get("source_file") else ""
             console.print(
                 f"{indent}  [dim]{label}: {str(c.get('sha', ''))[:8]} "
@@ -457,7 +531,7 @@ def _render_archaeology(console, arch: dict, *, indent: str) -> None:
         total = arch.get(f"{key}_total")
         if total:
             console.print(
-                f"{indent}  [dim]{len(rows)} of {total} {label} shown; "
+                f"{indent}  [dim]{len(rows)} of {total} {label} inspected; "
                 f"pass --full for the rest.[/dim]"
             )
 

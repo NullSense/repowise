@@ -1,8 +1,7 @@
 import * as React from "react";
-import { bandForScore, HEALTH_BAND_LABEL } from "@repowise-dev/types/health";
 import type { RepoIndexStatus } from "@repowise-dev/types/repos";
-import { healthInk } from "../health/tokens";
 import { formatNumber, formatRelativeTime } from "../lib/format";
+import { healthMark } from "../health/tokens";
 import { RepoAvatar } from "./repo-avatar";
 
 export interface RepoRow {
@@ -101,10 +100,8 @@ function figuresFor(repo: RepoRow): string[] {
  * the ribbon above it.
  *
  * Health leads the right-hand column because it is the figure that decides
- * which repo you open. It is painted on `bandForScore`, the canonical three
- * bands, rather than the five-step `healthBand` reading: that one belongs to a
- * lede, where nothing adjacent contradicts it, and a column of rows is the
- * case where two ladders visibly disagree.
+ * which repo you open. It is a health mark on the shared three bands, so a
+ * repo reads the same word and colour here as on the system map.
  */
 export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
   const A = LinkComponent ?? "a";
@@ -115,7 +112,7 @@ export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
       {repos.map((repo) => {
         const figures = figuresFor(repo);
         const actions = actionsFor?.(repo);
-        const band = repo.health === null ? null : bandForScore(repo.health);
+        const mark = repo.health === null ? null : healthMark(repo.health);
 
         return (
           <li key={repo.id} className="group">
@@ -166,7 +163,7 @@ export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
                   <p className="font-mono text-[10px] uppercase tracking-[0.12em] text-[var(--color-text-tertiary)]">
                     Health
                   </p>
-                  {repo.health === null || band === null ? (
+                  {repo.health === null || mark === null ? (
                     <p
                       className="mt-1 text-[15px] leading-none text-[var(--color-text-tertiary)]"
                       title="No health snapshot yet — this repository has not been analysed."
@@ -177,15 +174,15 @@ export function RepoRows({ repos, LinkComponent, actionsFor }: RepoRowsProps) {
                     <>
                       <p
                         className="mt-1 text-[22px] font-semibold leading-none tabular-nums"
-                        style={{ color: healthInk(repo.health) }}
+                        style={{ color: mark.color }}
                       >
-                        {repo.health.toFixed(1)}
+                        {mark.value}
                       </p>
                       <p
                         className="mt-1 text-[11px]"
-                        style={{ color: healthInk(repo.health) }}
+                        style={{ color: mark.color }}
                       >
-                        {HEALTH_BAND_LABEL[band]}
+                        {mark.label}
                       </p>
                     </>
                   )}

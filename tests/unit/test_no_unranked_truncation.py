@@ -75,7 +75,7 @@ _CUTS = [
     Cut(
         "assemble_module_page.key_classes",
         "core/src/repowise/core/generation/context/assembler.py",
-        "for fc in sorted(file_contexts, key=lambda fc: (-fc.pagerank_score, fc.file_path)):",
+        "by_rank = sorted(file_contexts, key=lambda fc: (-fc.pagerank_score, fc.file_path))",
         "the file's PageRank, before _MAX_KEY_CLASSES",
         forbids="for fc in file_contexts:\n            for h in fc.heritage",
     ),
@@ -102,7 +102,7 @@ _CUTS = [
         "pr_blast._transitive_affected",
         "core/src/repowise/core/analysis/pr_blast.py",
         "key=lambda item: (item[1], item[0])",
-        "depth then path, before will_break takes 15",
+        "depth then path, before may_break takes 15",
         forbids="frontier = list(set(changed_files))",
     ),
     Cut(

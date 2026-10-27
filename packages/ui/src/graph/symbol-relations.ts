@@ -41,7 +41,6 @@ const RELATION_LABELS: Record<string, Record<SymbolRelationDirection, string>> =
   // site. Runs consumer -> provider, so a fixture's inbound edges are the
   // tests it is wired into (388 of them for `client` on this repo).
   framework_binds: { in: "Wired into", out: "Wired to" },
-  reads: { in: "Read by", out: "Reads" },
   references: { in: "Referenced by", out: "References" },
 };
 
@@ -50,7 +49,8 @@ const RELATION_LABELS: Record<string, Record<SymbolRelationDirection, string>> =
 const GROUP_HINTS: Record<SymbolRelationGroup["group"], string> = {
   heritage: "Inherits or implements. Not a call site.",
   wiring: "Connected by a framework, so no call site exists in the source.",
-  reference: "Named without being called, such as a handler in a dispatch table.",
+  reference:
+    "Reached without a function call: a handler named in a dispatch table, or a Rust macro invocation.",
 };
 
 export function relationLabel(
@@ -68,7 +68,3 @@ export function relationLabel(
 export function relationHint(group: SymbolRelationGroup["group"]): string | undefined {
   return GROUP_HINTS[group];
 }
-
-/** Edge types this module can name, for the cross-language pin test. */
-export const KNOWN_RELATION_EDGE_TYPES: readonly string[] =
-  Object.keys(RELATION_LABELS).sort();

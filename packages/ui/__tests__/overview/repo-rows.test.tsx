@@ -63,12 +63,12 @@ describe("RepoRows", () => {
     expect(screen.getByText("—")).toBeTruthy();
   });
 
-  it("bands the score on the canonical three-band ladder", () => {
+  it("reads the score on the three bands of a health mark", () => {
     render(
       <RepoRows
         repos={[
           row({ id: "a", name: "alpha", health: 9.1 }),
-          row({ id: "b", name: "beta", health: 5.0 }),
+          row({ id: "b", name: "beta", health: 7.4 }),
           row({ id: "c", name: "gamma", health: 3.0 }),
         ]}
       />,
@@ -77,6 +77,15 @@ describe("RepoRows", () => {
     expect(screen.getByText("Healthy")).toBeTruthy();
     expect(screen.getByText("Warning")).toBeTruthy();
     expect(screen.getByText("Alert")).toBeTruthy();
+  });
+
+  // The bug this guards: a 7.4 repo read green "Good" here and amber
+  // "Warning" on the system map.
+  it("reads a mid-seven score as Warning, as the system map does", () => {
+    render(<RepoRows repos={[row({ health: 7.4 })]} />);
+
+    expect(screen.getByText("Warning")).toBeTruthy();
+    expect(screen.queryByText("Good")).toBeNull();
   });
 
   it("does not quote figures for a repo that was never indexed", () => {

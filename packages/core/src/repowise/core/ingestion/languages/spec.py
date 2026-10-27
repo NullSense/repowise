@@ -12,6 +12,7 @@ a leaf dependency — it imports nothing from the ingestion pipeline.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 
@@ -26,16 +27,22 @@ class LanguageSpec:
     # -- File matching ---------------------------------------------------
     extensions: frozenset[str] = field(default_factory=frozenset)  # (".py", ".pyi")
     special_filenames: frozenset[str] = field(default_factory=frozenset)  # ("Dockerfile",)
+    # Lowercase multi-dot name endings (``.flow-meta.xml``), matched before the one-suffix lookup.
+    name_suffixes: frozenset[str] = field(default_factory=frozenset)
 
     # -- Classification --------------------------------------------------
     is_code: bool = True  # False for yaml, json, markdown, etc.
     is_infra: bool = False  # True for dockerfile, makefile, terraform, shell
     is_passthrough: bool = False  # True = no AST parser (config/data/markup)
     is_api_contract: bool = False  # True for proto, graphql, openapi
+    # True when files/symbols are invoked primarily by an external runtime and
+    # static reachability therefore cannot support dead-code claims.
+    dead_code_exempt: bool = False
 
     # -- Tree-sitter -----------------------------------------------------
     grammar_package: str | None = None  # "tree_sitter_python"
     grammar_loader: str = "language"  # function name in grammar package
+    grammar_loader_args: tuple[str, ...] = ()  # args for shared grammar packs
     scm_file: str | None = None  # "python.scm" — None = no AST queries
     shares_grammar_with: str | None = None  # C shares cpp grammar
 
@@ -77,6 +84,16 @@ class LanguageSpec:
     # ``Test.java`` never do (conventions match with their own case).
     test_camel_suffixes: tuple[str, ...] = ()  # ("Test", "Tests", "IT")
 
+    # Case-sensitive camel-boundary test PREFIXES — the mirror of
+    # ``test_camel_suffixes`` for languages whose test-program convention
+    # names the file ``Test<Subject>`` rather than ``<Subject>Test``.
+    # ``TestKeymap.dpr`` matches (Delphi's standalone console-test-program
+    # convention: one ``Test<Unit>.dpr`` per unit under test, sometimes
+    # exercising several units at once); ``Testing.dpr`` and bare
+    # ``Test.dpr`` never do (conventions match with their own case, and
+    # need a following uppercase letter to be a real word boundary).
+    test_camel_prefixes: tuple[str, ...] = ()  # ("Test",)
+
     # Case-sensitive camel-boundary suffixes marking test *fixture* files
     # ("ParameterizedTypeFixtures.java") — support data living in the test
     # tree. A fixtures file provides data, it doesn't verify behavior, so
@@ -90,9 +107,11 @@ class LanguageSpec:
 
     # Single-segment test-dir tokens that are UNAMBIGUOUS for this
     # language's files. The generic table treats "spec(s)/" as ambiguous
-    # (OpenAPI specs, language specs) and demands a test-shaped filename —
-    # but a Ruby file under spec/ is RSpec material whatever its name
-    # (support helpers, vendored fixtures like okjson.rb included).
+    # (OpenAPI specs, language specs) and "t/" as ambiguous (a single
+    # letter) and demands a test-shaped filename — but a Ruby file under
+    # spec/ is RSpec material whatever its name (support helpers, vendored
+    # fixtures like okjson.rb included), and a Python file under t/ is test
+    # material whatever its name.
     test_dir_tokens: tuple[str, ...] = ()
 
     # Case-sensitive directory-segment suffixes that mark a test project
@@ -121,6 +140,10 @@ class LanguageSpec:
     # -- Ecosystem -------------------------------------------------------
     entry_point_patterns: tuple[str, ...] = ()  # ("main.py", "app.py")
     manifest_files: tuple[str, ...] = ()  # ("pyproject.toml",)
+    # Package manifests whose name varies per package, as globs matched
+    # case-insensitively by the package-root scan only. Exact-name readers of
+    # ``manifest_files`` never see them.
+    manifest_globs: tuple[str, ...] = ()  # ("*.csproj",)
     # The subset of ``manifest_files`` that configures a build rather than
     # declaring a distributable unit. Every name in ``manifest_files`` and not
     # here is a *package root*: it marks its directory as a package boundary
@@ -154,6 +177,29 @@ class LanguageSpec:
     # that set is matched receiver-blind in the parser and drops the call site
     # outright, which would also delete a real ``obj.unwrap()`` edge.
     builtin_methods: frozenset[str] = field(default_factory=frozenset)
+    # Type names a call may be made ON that this repository does not own:
+    # ``Vec::new()``, ``HashMap::default()``. Read only by the repo-wide
+    # receiver tier in ``CallResolver``, which has no uniqueness gate, so a
+    # repository that writes ``impl SomeTrait for Vec<Entity>`` otherwise hands
+    # that method back for every ``Vec`` in the tree whatever its element type.
+    #
+    # Deliberately its own field rather than a reuse of ``builtin_types``,
+    # which answers a different question - whether a *type reference* can point
+    # at a repo file - and is populated for nine languages. Keeping them apart
+    # is what makes this change a no-op on every language but the one measured.
+    external_receiver_types: frozenset[str] = field(default_factory=frozenset)
+    # ``{external type: {static method: the type name it returns}}``, for the
+    # head of a chained call: ``Duration.ofSeconds(3).toNanos()``. Read only by
+    # the chained-call tier in ``CallResolver``, which otherwise resolves the
+    # outer ``toNanos`` by bare name and hands it whatever same-named method the
+    # repository happens to declare.
+    #
+    # A return type rather than a refusal set, because the recorded type is what
+    # decides which of the two answers is right: a repository declaring its own
+    # type of that name gets a retarget, one that does not gets a refusal.
+    # Populated only where the return type is external for *every* repository,
+    # so a name a repository plausibly declares in its own right stays off it.
+    external_return_types: Mapping[str, Mapping[str, str]] = field(default_factory=dict)
 
     # -- Display ---------------------------------------------------------
     color_hex: str = "#8b5cf6"  # fallback purple ("other")

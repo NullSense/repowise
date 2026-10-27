@@ -38,6 +38,8 @@ from __future__ import annotations
 import re
 from typing import TYPE_CHECKING
 
+from repowise.core.ingestion.source_mask import mask_source
+
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
@@ -109,126 +111,8 @@ _SINK_CALL_NAMES_BY_SUFFIX: dict[str, frozenset[str]] = {
     ".js": frozenset({"fetch"}),
     ".jsx": frozenset({"fetch"}),
     ".mjs": frozenset({"fetch"}),
+    ".py": frozenset({"urlopen"}),  # stdlib, and its first argument is the URL
 }
-
-
-_JS_LIKE = frozenset({".ts", ".tsx", ".js", ".jsx", ".mjs"})
-
-# A ``/`` opens a regex literal (rather than dividing) when the previous
-# significant character cannot end an expression. The standard heuristic, and
-# enough to stop a ``/\\)/`` corrupting a parenthesis scan.
-_REGEX_PRECEDERS = frozenset("(,=:[!&|?{};+-*%~^<>")
-
-
-def mask_source(text: str, suffix: str, *, strings: bool = False) -> str:
-    """Blank out comments — and optionally string bodies — preserving offsets.
-
-    Every masked character is replaced by a space and newlines are kept, so the
-    result is the same length as *text* and indexes into it interchangeably.
-    That is what lets the call scanner match against masked text while slicing
-    arguments by the same offsets.
-
-    Two callers, two needs. Sink detection masks strings as well, because a
-    ``fetch(`` inside a comment or a string is not a call — without this, a
-    symbol is confirmed an HTTP wrapper by a line like
-    ``// used to fetch(path) directly``, which is the name-guessing failure
-    reappearing through the back door. The call-site scanner masks comments
-    only, since it still has to read the URL literal it is looking for.
-    """
-    if suffix.lower() not in _JS_LIKE:
-        # Python: ``#`` to end of line. Triple-quoted strings are left alone;
-        # no sink pattern here matches inside one without a call following it.
-        if suffix.lower() != ".py":
-            return text
-        out = list(text)
-        i, n, in_str = 0, len(text), ""
-        while i < n:
-            ch = text[i]
-            if in_str:
-                if ch == "\\":
-                    i += 2
-                    continue
-                if ch == in_str:
-                    in_str = ""
-            elif ch in "'\"":
-                in_str = ch
-            elif ch == "#":
-                while i < n and text[i] != "\n":
-                    out[i] = " "
-                    i += 1
-                continue
-            i += 1
-        return "".join(out)
-
-    out = list(text)
-    i, n = 0, len(text)
-    # Stack of open template literals, so a nested `` `x` `` inside ``${...}``
-    # is opened rather than read as closing the outer one.
-    tmpl_depth: list[int] = []
-    quote = ""
-    prev_sig = ""
-    while i < n:
-        ch = text[i]
-        if quote:
-            if ch == "\\":
-                if strings:
-                    out[i] = " "
-                    if i + 1 < n and text[i + 1] != "\n":
-                        out[i + 1] = " "
-                i += 2
-                continue
-            if quote == "`" and ch == "$" and i + 1 < n and text[i + 1] == "{":
-                tmpl_depth.append(1)
-                quote = ""
-                i += 2
-                continue
-            if ch == quote:
-                quote = ""
-            elif strings:
-                out[i] = " " if ch != "\n" else "\n"
-            i += 1
-            continue
-        if ch == "/" and i + 1 < n and text[i + 1] == "/":
-            while i < n and text[i] != "\n":
-                out[i] = " "
-                i += 1
-            continue
-        if ch == "/" and i + 1 < n and text[i + 1] == "*":
-            while i < n and not (text[i] == "*" and i + 1 < n and text[i + 1] == "/"):
-                if text[i] != "\n":
-                    out[i] = " "
-                i += 1
-            for j in range(i, min(i + 2, n)):
-                out[j] = " "
-            i += 2
-            continue
-        if ch == "/" and prev_sig in _REGEX_PRECEDERS:
-            i += 1
-            while i < n and text[i] != "\n":
-                if text[i] == "\\":
-                    out[i] = " "
-                    if i + 1 < n:
-                        out[i + 1] = " "
-                    i += 2
-                    continue
-                if text[i] == "/":
-                    out[i] = " "
-                    i += 1
-                    break
-                out[i] = " "
-                i += 1
-            continue
-        if ch in "'\"`":
-            quote = ch
-        elif tmpl_depth and ch == "}":
-            tmpl_depth.pop()
-            quote = "`"
-        elif tmpl_depth and ch == "{":
-            tmpl_depth[-1] += 1
-        if not ch.isspace():
-            prev_sig = ch
-        i += 1
-    return "".join(out)
 
 
 def sink_patterns(suffix: str) -> tuple[re.Pattern[str], ...]:
@@ -267,6 +151,72 @@ def symbol_body(lines: list[str], symbol: IndexedSymbol) -> str:
     head = decl[brace + 1 :] if brace >= 0 else ""
     rest = lines[first + 1 : end]
     return "\n".join([head, *rest]) if head else "\n".join(rest)
+
+
+# The module qualifier is required and is what makes this safe: a bare
+# ``Session(`` is SQLAlchemy far more often than requests, and binding it would
+# read every ``session.get(Model, pk)`` as an endpoint call.
+_PY_CLIENT_CTOR = (
+    r"(?P<lib>httpx|requests|aiohttp)\s*\.\s*"
+    r"(?:AsyncClient|Client|ClientSession|Session)\s*\("
+)
+
+# ``client = httpx.AsyncClient(...)``, ``self._c = client or httpx.Client()``.
+_PY_CLIENT_ASSIGN_RE = re.compile(
+    r"^[ \t]*(?P<attr>self\s*\.\s*)?(?P<var>[A-Za-z_]\w*)\s*(?::[^=\n]+)?=\s*(?!=)"
+    r"(?:[^\n=]*?\bor\s+)?(?:await\s+)?" + _PY_CLIENT_CTOR,
+    re.MULTILINE,
+)
+
+# ``async with httpx.AsyncClient(...) as client:``
+_PY_CLIENT_WITH_RE = re.compile(
+    r"\bwith\s+(?:await\s+)?" + _PY_CLIENT_CTOR + r"[^\n]*?\bas\s+(?P<var>[A-Za-z_]\w*)"
+)
+
+
+def bound_clients(
+    content: str, suffix: str, symbols: Sequence[IndexedSymbol]
+) -> list[tuple[str, str, int, int]]:
+    """``(var, library, from_line, to_line)`` for each HTTP client instance bound.
+
+    Python's dominant client shape binds the client to a variable
+    (``async with httpx.AsyncClient() as http``) and calls the endpoint through
+    it (``http.post(url)``). That receiver is neither absent nor ``self``, so
+    :func:`confirm_wrappers` never sees the call — the sink *is* the call.
+
+    The binding is scoped to the enclosing symbol, not to the file. Measured on
+    ``backend/modal_app/content_engine_chain.py``: ``client`` is an
+    ``httpx.AsyncClient`` in one function and a Supabase client in another, so a
+    file-wide binding would read a database call as an endpoint call. An
+    *attribute* binding (``self._client = httpx.Client()``) is file-scoped
+    instead, since it is assigned in one method to be read from others.
+
+    Empty for a language with no entry, like the sink tables.
+    """
+    if suffix.lower() != ".py":
+        return []
+    # Narrowest span first, so the first hit is the tightest enclosing scope.
+    spans = sorted(
+        ((s.start_line, s.end_line) for s in symbols if s.kind in _CALLABLE_KINDS),
+        key=lambda se: se[1] - se[0],
+    )
+    whole_file = (1, content.count("\n") + 1)
+
+    def scope(line: int, is_attr: bool) -> tuple[int, int]:
+        if is_attr:
+            return whole_file
+        for start, end in spans:
+            if start <= line <= end:
+                return start, end
+        return whole_file  # module level: the client really is file-wide
+
+    out: list[tuple[str, str, int, int]] = []
+    for regex in (_PY_CLIENT_ASSIGN_RE, _PY_CLIENT_WITH_RE):
+        for m in regex.finditer(content):
+            line = content.count("\n", 0, m.start()) + 1
+            start, end = scope(line, m.groupdict().get("attr") is not None)
+            out.append((m.group("var"), m.group("lib"), start, end))
+    return out
 
 
 def _callable_symbols(symbols: Sequence[IndexedSymbol]) -> dict[str, list[IndexedSymbol]]:

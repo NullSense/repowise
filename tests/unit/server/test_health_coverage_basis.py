@@ -122,9 +122,118 @@ async def test_an_ingested_report_answers_as_measured(client, session, tmp_path)
     body = await _get(client, repo["id"], limit=500)
 
     assert body["basis"] == "measured"
-    # The graph is present and says something, and it stays out of the answer.
-    assert "inferred" not in body
     assert body["summary"]["line_coverage_pct"] == 40.0
+    # The measured rows fill `files`; the inferred block (served when the
+    # report missed some files) is present but has nothing to add here, because
+    # every file has a measured row. `files_total` is 0, so the UI renders no
+    # gap section.
+    assert body["inferred"]["files_total"] == 0
+    assert body["inferred"]["measured_file_count"] == 1
+
+
+async def test_partial_report_answers_measured_and_fills_the_gap(
+    client, session, tmp_path
+):
+    """A report that missed some files is measured, with the graph filling the gap.
+
+    This is the bug in #1763: one stored row selects the measured basis for the
+    whole repo, and every file the lcov report never mentioned became invisible
+    on the Tests tab. The fix serves the graph-inferred answer for exactly those
+    files, in a separate ``inferred`` block scoped to non-measured paths, so a
+    partial ingest stops hiding the files it did not mention.
+    """
+    repo = await create_test_repo(client, tmp_path)
+    # Only src/a.py has a measured row.
+    await save_coverage_files(
+        session,
+        repo["id"],
+        [
+            {
+                "file_path": "src/a.py",
+                "line_coverage_pct": 40.0,
+                "covered_lines": [1],
+                "total_coverable_lines": 10,
+                "branch_coverage_pct": None,
+            }
+        ],
+        source_format="lcov",
+    )
+    # src/b.py has no measured row but IS reached by a test; src/c.py is not.
+    await save_health_metrics(
+        session,
+        repo["id"],
+        [_metric("src/a.py"), _metric("src/b.py"), _metric("src/c.py")],
+    )
+    await _seed_graph(
+        session,
+        repo["id"],
+        nodes={
+            "tests/test_a.py": True,
+            "src/a.py": False,
+            "src/b.py": False,
+            "src/c.py": False,
+        },
+        edges=_calls("tests/test_a.py", "src/b.py"),
+    )
+    await session.commit()
+
+    body = await _get(client, repo["id"])
+
+    # Measured basis, measured rows in `files`.
+    assert body["basis"] == "measured"
+    assert [f["file_path"] for f in body["files"]] == ["src/a.py"]
+    assert body["summary"]["file_count"] == 1
+
+    # The inferred block answers the non-measured files only — never both.
+    assert body["inferred"]["measured_file_count"] == 1
+    reached = {f["file_path"]: f["reached"] for f in body["inferred"]["files"]}
+    assert reached == {"src/b.py": True, "src/c.py": False}
+    assert body["inferred"]["files_total"] == 2
+    assert body["inferred"]["files_reached"] == 1
+    assert body["inferred"]["files_not_reached"] == 1
+
+    # The inferred payload carries no percentage — the invariant holds on the
+    # hybrid shape too.
+    blob = json.dumps(body["inferred"])
+    assert "pct" not in blob
+
+
+async def test_the_hybrid_inferred_map_carries_no_percentage(
+    client, session, tmp_path
+):
+    """Same no-ratio rule as the pure-inferred shape, on the hybrid block."""
+    repo = await create_test_repo(client, tmp_path)
+    await save_coverage_files(
+        session,
+        repo["id"],
+        [
+            {
+                "file_path": "src/a.py",
+                "line_coverage_pct": 40.0,
+                "covered_lines": [1],
+                "total_coverable_lines": 10,
+                "branch_coverage_pct": None,
+            }
+        ],
+        source_format="lcov",
+    )
+    await save_health_metrics(
+        session,
+        repo["id"],
+        [_metric("src/a.py"), _metric("src/b.py")],
+    )
+    await _seed_graph(
+        session,
+        repo["id"],
+        nodes={"tests/test_a.py": True, "src/a.py": False, "src/b.py": False},
+        edges=_calls("tests/test_a.py", "src/b.py"),
+    )
+    await session.commit()
+
+    body = await _get(client, repo["id"])
+
+    assert body["basis"] == "measured"
+    assert "pct" not in json.dumps(body["inferred"])
 
 
 async def test_no_report_falls_back_to_the_graph(client, session, tmp_path):
@@ -143,6 +252,8 @@ async def test_no_report_falls_back_to_the_graph(client, session, tmp_path):
     body = await _get(client, repo["id"])
 
     assert body["basis"] == "inferred"
+    # A report trend is a measured fact; the inferred shape never carries one.
+    assert "history" not in body
     reached = {f["file_path"]: f["reached"] for f in body["inferred"]["files"]}
     assert reached == {"src/a.py": True, "src/b.py": False}
     assert body["inferred"]["files_reached"] == 1
@@ -449,9 +560,9 @@ async def test_the_file_endpoint_says_when_the_list_was_cut(
     the evidence. Measured on this repository, one file is reached by 124 tests
     and would have rendered as 50.
     """
-    import repowise.core.analysis.test_reachability as tr
+    from repowise.core.analysis.test_reach import model
 
-    monkeypatch.setattr(tr, "MAX_TESTS_PER_TARGET", 2)
+    monkeypatch.setattr(model, "MAX_TESTS_PER_TARGET", 2)
     repo = await create_test_repo(client, tmp_path)
     tests = [f"tests/test_{i}.py" for i in range(5)]
     edges = [e for t in tests for e in _calls(t, "src/a.py")]
@@ -491,3 +602,143 @@ async def test_the_file_endpoint_404s_for_an_unknown_repo(client):
         "/api/repos/nope/health/tests-reaching", params={"file_path": "src/a.py"}
     )
     assert resp.status_code == 404
+
+
+# ------------------------------------------------------------------ #
+# One reach definition for the tab and the file page
+# ------------------------------------------------------------------ #
+
+
+async def test_the_tab_and_the_file_page_agree_on_every_file(client, session, tmp_path):
+    """A file is reached on the tab exactly when its own page lists tests.
+
+    Covers each tier: a call, an import only, an import through a test-only
+    helper, one further up a chain of source imports, and a file whose only
+    test replaces it. A file a test only imports is reached on both surfaces.
+    """
+    repo = await create_test_repo(client, tmp_path)
+    # The replacing test's text is read from the checkout.
+    (tmp_path / "test-repo" / "tests").mkdir()
+    (tmp_path / "test-repo" / "tests" / "test_mock.py").write_text(
+        'from unittest.mock import patch\n@patch("app.swapped")\ndef test_it(m): ...\n',
+        encoding="utf-8",
+    )
+    files = [
+        "src/called.py",
+        "src/imported.py",
+        "src/behind_helper.py",
+        "src/deep.py",
+        "app/swapped.py",
+        "src/lonely.py",
+    ]
+    await save_health_metrics(session, repo["id"], [_metric(p) for p in files])
+    await _seed_graph(
+        session,
+        repo["id"],
+        nodes={
+            "tests/test_a.py": True,
+            "tests/test_mock.py": True,
+            "app/__init__.py": False,
+            "tests/support.py": False,
+            "src/top.py": False,
+            "src/mid.py": False,
+            "src/app.py": False,
+            **{p: False for p in files},
+        },
+        edges=[
+            *_calls("tests/test_a.py", "src/called.py"),
+            *_calls("tests/test_mock.py", "app/swapped.py"),
+            ("tests/test_a.py", "src/imported.py", "imports"),
+            ("tests/test_a.py", "tests/support.py", "imports"),
+            ("tests/support.py", "src/behind_helper.py", "imports"),
+            # A chain through source files nothing else marks as test support.
+            ("tests/test_a.py", "src/top.py", "imports"),
+            ("src/top.py", "src/mid.py", "imports"),
+            ("src/app.py", "src/mid.py", "imports"),
+            ("src/mid.py", "src/deep.py", "imports"),
+        ],
+    )
+    await session.commit()
+
+    tab = await _get(client, repo["id"])
+    on_tab = {f["file_path"]: f["reached"] for f in tab["inferred"]["files"]}
+    pages = {p: await _reaching(client, repo["id"], p) for p in files}
+
+    assert on_tab == {p: page["reached"] for p, page in pages.items()}
+    assert on_tab == {
+        "src/called.py": True,
+        "src/imported.py": True,
+        "src/behind_helper.py": True,
+        "src/deep.py": True,
+        "app/swapped.py": True,
+        "src/lonely.py": False,
+    }
+    assert tab["inferred"]["files_reached"] == 5
+    assert tab["inferred"]["files_not_reached"] == 1
+    assert {p: page["via"] for p, page in pages.items()} == {
+        "src/called.py": "call-graph",
+        "src/imported.py": "import-graph",
+        "src/behind_helper.py": "indirect-import",
+        "src/deep.py": "indirect-import",
+        "app/swapped.py": "mocked-only",
+        "src/lonely.py": None,
+    }
+    assert pages["src/behind_helper.py"]["tests"] == ["tests/test_a.py"]
+    assert pages["app/swapped.py"]["tests"] == ["tests/test_mock.py"]
+
+
+async def test_a_failed_walk_answers_unavailable_not_none(
+    client, session, tmp_path, monkeypatch
+):
+    """A failure is not "the graph had nothing to say", on either route."""
+    from repowise.server.routers.code_health import coverage_routes
+
+    async def broken(*args, **kwargs):
+        raise RuntimeError("walk failed")
+
+    monkeypatch.setattr(coverage_routes, "any_tests_reaching", broken)
+    monkeypatch.setattr(coverage_routes, "tests_reaching_by_tier", broken)
+    repo = await create_test_repo(client, tmp_path)
+    await save_health_metrics(session, repo["id"], [_metric("src/a.py")])
+    await _seed_graph(
+        session,
+        repo["id"],
+        nodes={"tests/test_a.py": True, "src/a.py": False},
+        edges=_calls("tests/test_a.py", "src/a.py"),
+    )
+    await session.commit()
+
+    body = await _get(client, repo["id"])
+    assert body["basis"] == "unavailable"
+    assert "inferred" not in body
+
+    detail = await _reaching(client, repo["id"], "src/a.py")
+    assert detail["basis"] == "unavailable"
+    assert detail["reached"] is False
+
+
+async def test_a_file_of_only_types_is_not_a_row_nothing_reaches(client, session, tmp_path):
+    """A ``.d.ts`` or a module of ``TypedDict`` classes has nothing a test could run."""
+    repo = await create_test_repo(client, tmp_path)
+    root = tmp_path / "test-repo" / "src"
+    root.mkdir()
+    (root / "types.py").write_text(
+        "from typing import TypedDict\n\nclass Row(TypedDict):\n    a: int\n", encoding="utf-8"
+    )
+    (root / "c.py").write_text("def run():\n    return 1\n", encoding="utf-8")
+    paths = ["src/a.py", "src/c.py", "src/types.py", "src/api.d.ts"]
+    await save_health_metrics(session, repo["id"], [_metric(p) for p in paths])
+    await _seed_graph(
+        session,
+        repo["id"],
+        nodes={"tests/test_a.py": True, **{p: False for p in paths}},
+        edges=_calls("tests/test_a.py", "src/a.py"),
+    )
+    await session.commit()
+
+    body = await _get(client, repo["id"])
+
+    reached = {f["file_path"]: f["reached"] for f in body["inferred"]["files"]}
+    assert reached == {"src/a.py": True, "src/c.py": False}
+    assert body["inferred"]["files_total"] == 2
+    assert body["inferred"]["files_not_reached"] == 1

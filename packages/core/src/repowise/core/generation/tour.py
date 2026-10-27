@@ -36,9 +36,10 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from repowise.core.entry_candidacy import non_code_entry_languages, not_an_execution_start
-from repowise.core.generation.layers import ADJACENT_LAYERS, infer_layer, is_support_path
+from repowise.core.generation.layers import ADJACENT_LAYERS, infer_layer
 from repowise.core.ids import is_external
 from repowise.core.ingestion.languages.registry import REGISTRY as _LANG_REGISTRY
+from repowise.core.support_paths import is_support_path
 
 # Filenames that conventionally mark an executable / wiring entry point.
 # Derived from the language registry (generic stems + per-language stems);
@@ -95,6 +96,8 @@ def score_entry_points(
     """Score code files as candidate tour entry points, descending.
 
     Scoring (additive):
+      * declared by a manifest or an application main .. +6 (code files only;
+        more than every guess below adds up to, as the orientation list ranks it)
       * ``is_entry_point`` ingestion flag .............. +3 (code files only)
       * filename stem in the entry-name set ............ +3 (code files only)
       * file at repo root or one level deep ............ +1
@@ -131,6 +134,10 @@ def score_entry_points(
             and infer_layer(path, language) not in ADJACENT_LAYERS
             and not is_support_path(path)
         )
+        if entry_eligible and (
+            getattr(fi, "is_manifest_entry", False) or getattr(fi, "is_application_main", False)
+        ):
+            score += 6.0
         if entry_eligible and getattr(fi, "is_entry_point", False):
             score += 3.0
         if entry_eligible and PurePosixPath(path).stem.lower() in _ENTRY_FILENAME_STEMS:
